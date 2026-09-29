@@ -13,7 +13,7 @@ import itertools
 import json
 import sqlite3
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,6 +70,8 @@ class ExperimentConfig:
     target_noise_levels: tuple[float, ...]
     robustness_seeds: tuple[int, ...]
     robustness_fold_count: int
+    selection_leaf_sizes: tuple[int, ...] = (1, 2, 4, 8, 16, 32)
+    selection_split_sizes: tuple[int, ...] = (2, 4, 8, 16, 32, 64)
 
 
 SMOKE_CONFIG = ExperimentConfig(
@@ -99,6 +101,8 @@ SMOKE_CONFIG = ExperimentConfig(
     target_noise_levels=(0.0, 0.10),
     robustness_seeds=(0,),
     robustness_fold_count=3,
+    selection_leaf_sizes=(1, 4),
+    selection_split_sizes=(2, 8),
 )
 
 FULL_CONFIG = ExperimentConfig(
@@ -411,6 +415,66 @@ CREATE INDEX IF NOT EXISTS idx_robust_view ON robustness_results
 """
 
 
+APPEND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS generation_history (
+    digest TEXT PRIMARY KEY, config TEXT NOT NULL, runtime TEXT NOT NULL, started_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS experiment_provenance (
+    table_name TEXT NOT NULL, row_key TEXT NOT NULL, digest TEXT NOT NULL,
+    PRIMARY KEY (table_name, row_key)
+);
+CREATE TABLE IF NOT EXISTS selection_experiments (
+    experiment TEXT PRIMARY KEY, parameter TEXT NOT NULL, candidates TEXT NOT NULL,
+    outer_folds INTEGER NOT NULL, inner_folds INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS selection_scores (
+    experiment TEXT NOT NULL, workflow TEXT NOT NULL, outer_seed INTEGER NOT NULL,
+    r2 REAL NOT NULL, mae REAL NOT NULL, rmse REAL NOT NULL,
+    PRIMARY KEY (experiment, workflow, outer_seed)
+);
+CREATE TABLE IF NOT EXISTS selection_choices (
+    experiment TEXT NOT NULL, workflow TEXT NOT NULL, outer_seed INTEGER NOT NULL,
+    outer_fold INTEGER NOT NULL, selected_value TEXT NOT NULL,
+    PRIMARY KEY (experiment, workflow, outer_seed, outer_fold)
+);
+CREATE TABLE IF NOT EXISTS selection_predictions (
+    experiment TEXT NOT NULL, workflow TEXT NOT NULL, outer_seed INTEGER NOT NULL,
+    observation_id INTEGER NOT NULL, fold INTEGER NOT NULL, y_true REAL NOT NULL, y_pred REAL NOT NULL,
+    PRIMARY KEY (experiment, workflow, outer_seed, observation_id)
+);
+"""
+
+
+def exists(connection, table, **keys):
+    where = " AND ".join(f"{key}=?" for key in keys)
+    return connection.execute(f"SELECT 1 FROM {table} WHERE {where} LIMIT 1", tuple(keys.values())).fetchone() is not None
+
+
+def record_generation(connection, config, digest):
+    runtime = dict(python=sys.version.split()[0], numpy=np.__version__,
+                   pandas=pd.__version__, sklearn=sklearn.__version__,
+                   generator_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    with connection:
+        connection.execute("INSERT OR IGNORE INTO generation_history VALUES (?, ?, ?, ?)",
+                           (digest, config_json(config), json.dumps(runtime), datetime.now(timezone.utc).isoformat()))
+    # Triggers attach provenance in the same transaction as each result insertion.
+    natural_keys = {
+        "cluster_assignments": ("cluster_count", "observation_id"),
+        "convergence_results": ("cv_seed", "n_estimators"),
+        "validation_results": ("experiment_id",),
+        "hyperparameter_results": ("experiment_id",),
+        "importance_runs": ("run_id",),
+        "robustness_results": ("result_id",),
+        "selection_scores": ("experiment", "workflow", "outer_seed"),
+    }
+    for table, columns in natural_keys.items():
+        key = "json_array(" + ", ".join(f"NEW.{column}" for column in columns) + ")"
+        connection.execute(f"DROP TRIGGER IF EXISTS provenance_{table}")
+        connection.execute(f"""CREATE TEMP TRIGGER provenance_{table} AFTER INSERT ON main.{table}
+            BEGIN INSERT INTO experiment_provenance VALUES ('{table}', {key}, '{digest}'); END""")
+    connection.commit()
+
+
 def config_json(config: ExperimentConfig) -> str:
     return json.dumps(asdict(config), sort_keys=True, separators=(",", ":"))
 
@@ -421,16 +485,9 @@ def config_hash(config: ExperimentConfig, dataset_sha256: str) -> str:
         f"schema={SCHEMA_VERSION};dataset_sha256={dataset_sha256};"
         f"config={config_json(config)};python={sys.version.split()[0]};"
         f"numpy={np.__version__};pandas={pd.__version__};"
-        f"sklearn={sklearn.__version__}"
+        f"sklearn={sklearn.__version__};generator={hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}"
     )
     return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def stage_complete(connection, stage, digest):
-    row = connection.execute(
-        "SELECT config_hash FROM stage_status WHERE stage=?", (stage,)
-    ).fetchone()
-    return row is not None and row[0] == digest
 
 
 def mark_stage(connection, stage, digest):
@@ -450,10 +507,10 @@ def estimate_fit_count(config: ExperimentConfig) -> dict[str, int]:
         "ensemble_convergence": len(config.convergence_seeds)
         * len(config.convergence_estimators) * config.selection_outer_folds,
         "selection_non_nested": len(config.selection_outer_seeds)
-        * len(config.selection_depths) * config.selection_outer_folds,
+        * sum(map(len, selection_grids(config).values())) * config.selection_outer_folds,
         "selection_nested": len(config.selection_outer_seeds)
         * config.selection_outer_folds
-        * (len(config.selection_depths) * config.selection_inner_folds + 1),
+        * (sum(map(len, selection_grids(config).values())) * config.selection_inner_folds + 3),
         "validation_seeds": len(config.validation_seeds)
         * (sum(config.kfold_counts) + sum(config.loco_counts)),
         "hyperparameter_landscape": combinations
@@ -472,18 +529,30 @@ def initialize_database(connection, config, digest, dataset_sha256, dataset_path
                         df, compositions, X, y, target, excluded, missing_before,
                         overwrite):
     connection.executescript(SCHEMA_SQL)
+    connection.executescript(APPEND_SCHEMA)
     existing = {
         key: json.loads(value)
         for key, value in connection.execute("SELECT key, value FROM metadata")
     }
-    if existing and existing.get("config_hash") != digest and not overwrite:
-        raise RuntimeError(
-            "Database provenance is incompatible with the current schema, "
-            "configuration, or dataset contents. Use --overwrite or a different "
-            "--database; cached stages will not be mixed across provenance changes."
+    if existing and not overwrite:
+        invariant_fields = (
+            "fixed_n_estimators", "selection_outer_folds", "selection_inner_folds",
+            "representative_params", "permutation_repeats",
         )
+        changed = [key for key in invariant_fields
+                   if json.dumps(existing["config"][key]) != json.dumps(asdict(config)[key])]
+        if (existing.get("schema_version") != SCHEMA_VERSION
+                or existing.get("dataset_sha256") != dataset_sha256
+                or existing.get("rf_seed") != RF_SEED
+                or existing.get("cluster_seed") != CLUSTER_SEED or changed):
+            raise ValueError(f"Incompatible base experiment settings: {changed}. Use a separate --database.")
+        migrate_depth_results(connection, existing)
+        record_generation(connection, config, digest)
+        return  # Preserve original provenance and observations; requests live in generation_history.
     if overwrite:
         for table in (
+            "selection_experiments", "selection_scores", "selection_choices",
+            "selection_predictions", "generation_history", "experiment_provenance",
             "stage_status", "observations", "features", "excluded_columns",
             "cluster_assignments", "convergence_results", "model_selection_depth_choices",
             "model_selection_summary",
@@ -576,157 +645,163 @@ def initialize_database(connection, config, digest, dataset_sha256, dataset_path
         "INSERT OR REPLACE INTO excluded_columns VALUES (?, ?, ?)", excluded
     )
     connection.commit()
+    record_generation(connection, config, digest)
 
 
 def run_clusters(connection, config, digest, X, scaled):
     stage = "clusters"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
     counts = sorted(set(config.loco_counts + config.hyper_loco_counts +
                         (config.importance_fold_count, config.robustness_fold_count)))
     projection = PCA(n_components=2, random_state=CLUSTER_SEED).fit_transform(scaled)
-    rows = []
     for count in counts:
+        if exists(connection, "cluster_assignments", cluster_count=count):
+            continue
         labels = KMeans(n_clusters=count, random_state=CLUSTER_SEED, n_init=10).fit_predict(scaled)
         if len(np.unique(labels)) != count:
             raise RuntimeError("KMeans cluster occupancy check failed")
-        rows.extend(
+        rows = [
             (count, i, int(labels[i]), float(projection[i, 0]), float(projection[i, 1]))
             for i in range(len(X))
-        )
-    with connection:
-        connection.execute("DELETE FROM cluster_assignments")
-        connection.executemany(
-            "INSERT INTO cluster_assignments VALUES (?, ?, ?, ?, ?)", rows
-        )
+        ]
+        with connection:
+            connection.executemany(
+                "INSERT INTO cluster_assignments VALUES (?, ?, ?, ?, ?)", rows
+            )
     mark_stage(connection, stage, digest)
 
 
 def run_convergence(connection, config, digest, X, y, get_splits):
     stage = "convergence"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
-    rows = []
     for seed in config.convergence_seeds:
         splits = get_splits("kfold", config.selection_outer_folds, seed)
         for trees in config.convergence_estimators:
+            if exists(connection, "convergence_results", cv_seed=seed, n_estimators=trees):
+                continue
             pred = np.full(len(y), np.nan)
             for train, validation in splits:
                 forest = make_forest(config, n_estimators=trees, max_features=0.5)
                 forest.fit(X.iloc[train], y.iloc[train])
                 pred[validation] = forest.predict(X.iloc[validation])
             score = metrics(y, pred)
-            rows.append((seed, RF_SEED, len(splits), trees, *score))
-    with connection:
-        connection.execute("DELETE FROM convergence_results")
-        connection.executemany(
-            "INSERT INTO convergence_results VALUES (?, ?, ?, ?, ?, ?, ?)", rows
-        )
+            with connection:
+                connection.execute(
+                    "INSERT INTO convergence_results VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (seed, RF_SEED, len(splits), trees, *score),
+                )
     mark_stage(connection, stage, digest)
 
 
-def select_depth_inner(config, X_train, y_train, seed):
-    splitter = KFold(
-        n_splits=config.selection_inner_folds, shuffle=True, random_state=seed
-    )
-    best_depth, best_rmse = None, np.inf
-    for depth in config.selection_depths:
-        pred = np.full(len(y_train), np.nan)
-        for inner_train, inner_validation in splitter.split(X_train):
-            forest = make_forest(config, max_depth=depth, max_features=0.5)
-            forest.fit(X_train.iloc[inner_train], y_train.iloc[inner_train])
-            pred[inner_validation] = forest.predict(X_train.iloc[inner_validation])
-        rmse = mean_squared_error(y_train, pred) ** 0.5
-        if rmse < best_rmse:
-            best_depth, best_rmse = depth, rmse
-    return best_depth
+def selection_id(parameter, candidates, config):
+    return hashlib.sha256(json.dumps([
+        parameter, list(candidates), config.fixed_n_estimators,
+        config.selection_outer_folds, config.selection_inner_folds, RF_SEED,
+    ]).encode()).hexdigest()
+
+
+def migrate_depth_results(connection, metadata):
+    """Register legacy depth results without changing any original table or refitting."""
+    saved = metadata["config"]
+    config = replace(FULL_CONFIG, **{key: tuple(value) if isinstance(value, list) else value
+                                   for key, value in saved.items()})
+    experiment = selection_id("max_depth", config.selection_depths, config)
+    if exists(connection, "selection_experiments", experiment=experiment):
+        return
+    if not connection.execute("SELECT 1 FROM model_selection_summary LIMIT 1").fetchone():
+        return
+    with connection:
+        connection.execute("INSERT INTO selection_experiments VALUES (?, ?, ?, ?, ?)",
+                           (experiment, "max_depth", json.dumps(list(config.selection_depths)),
+                            config.selection_outer_folds, config.selection_inner_folds))
+        for workflow, seed, r2, mae, rmse in connection.execute(
+                "SELECT workflow, outer_seed, r2, mae, rmse FROM model_selection_summary").fetchall():
+            connection.execute("INSERT INTO selection_scores VALUES (?, ?, ?, ?, ?, ?)",
+                                        (experiment, workflow, seed, r2, mae, rmse))
+            connection.execute("INSERT OR IGNORE INTO experiment_provenance VALUES (?, ?, ?)",
+                               ("selection_scores", json.dumps([experiment, workflow, seed], separators=(",", ":")), metadata["config_hash"]))
+        connection.execute("""INSERT INTO selection_predictions
+            SELECT ?, workflow, outer_seed, observation_id, fold, y_true, y_pred
+            FROM model_selection_predictions""", (experiment,))
+        for workflow, seed, fold, depth in connection.execute("SELECT * FROM model_selection_depth_choices").fetchall():
+            connection.execute("INSERT INTO selection_choices VALUES (?, ?, ?, ?, ?)",
+                               (experiment, workflow, seed, fold, json.dumps(depth_from_db(depth))))
+        connection.execute("INSERT OR IGNORE INTO generation_history VALUES (?, ?, ?, ?)",
+                           (metadata["config_hash"], json.dumps(saved), json.dumps({
+                               key: metadata.get(key) for key in
+                               ("python_version", "numpy_version", "pandas_version", "sklearn_version")}),
+                            metadata.get("generated_utc", "legacy")))
+
+
+def selection_grids(config):
+    return {"max_depth": config.selection_depths,
+            "min_samples_leaf": config.selection_leaf_sizes,
+            "min_samples_split": config.selection_split_sizes}
+
+
+def selection_params(parameter, value):
+    params = dict(max_depth=None, min_samples_leaf=1, min_samples_split=2, max_features=0.5)
+    params[parameter] = value
+    return tuple(params.values())
 
 
 def run_model_selection(connection, config, digest, X, y, compositions, get_splits):
-    stage = "model_selection"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
-    summaries, depth_choice_rows, prediction_rows = [], [], []
-    for seed in config.selection_outer_seeds:
-        splits = get_splits("kfold", config.selection_outer_folds, seed)
-        candidate_predictions = {}
-        for depth in config.selection_depths:
-            candidate_predictions[depth], _, _ = oof_predictions(
-                config, X, y, splits, (depth, 1, 2, 0.5)
-            )
-        selected = min(
-            config.selection_depths,
-            key=lambda d: mean_squared_error(y, candidate_predictions[d]),
-        )
-        pred = candidate_predictions[selected]
-        score = metrics(y, pred)
-        summaries.append((
-            "same_evidence", seed, RF_SEED, len(splits), str(selected), *score
-        ))
-        depth_choice_rows.append(
-            ("same_evidence", seed, -1, depth_to_db(selected))
-        )
-        fold_map = np.full(len(y), -1)
-        for fold, (_, validation) in enumerate(splits):
-            fold_map[validation] = fold
-        prediction_rows.extend(
-            ("same_evidence", seed, int(fold_map[i]), i, compositions.iloc[i],
-             float(y.iloc[i]), float(pred[i])) for i in range(len(y))
-        )
-
-        nested_pred = np.full(len(y), np.nan)
-        fold_map = np.full(len(y), -1)
-        for fold, (train, validation) in enumerate(splits):
-            inner_depth = select_depth_inner(
-                config, X.iloc[train].reset_index(drop=True),
-                y.iloc[train].reset_index(drop=True), seed=10_000 + seed + fold,
-            )
-            depth_choice_rows.append(
-                ("nested", seed, fold, depth_to_db(inner_depth))
-            )
-            forest = make_forest(config, max_depth=inner_depth, max_features=0.5)
-            forest.fit(X.iloc[train], y.iloc[train])
-            nested_pred[validation] = forest.predict(X.iloc[validation])
-            fold_map[validation] = fold
-        score = metrics(y, nested_pred)
-        summaries.append(("nested", seed, RF_SEED, len(splits), "fold_specific", *score))
-        prediction_rows.extend(
-            ("nested", seed, int(fold_map[i]), i, compositions.iloc[i],
-             float(y.iloc[i]), float(nested_pred[i])) for i in range(len(y))
-        )
-    with connection:
-        connection.execute("DELETE FROM model_selection_predictions")
-        connection.execute("DELETE FROM model_selection_depth_choices")
-        connection.execute("DELETE FROM model_selection_summary")
-        connection.executemany(
-            "INSERT INTO model_selection_summary VALUES (?, ?, ?, ?, ?, ?, ?, ?)", summaries
-        )
-        connection.executemany(
-            "INSERT INTO model_selection_depth_choices VALUES (?, ?, ?, ?)",
-            depth_choice_rows,
-        )
-        connection.executemany(
-            "INSERT INTO model_selection_predictions VALUES (?, ?, ?, ?, ?, ?, ?)",
-            prediction_rows,
-        )
-    mark_stage(connection, stage, digest)
+    for parameter, candidates in selection_grids(config).items():
+        candidate_json = json.dumps(list(candidates))
+        # A new candidate set defines a different selection experiment; preserve the old one.
+        experiment = selection_id(parameter, candidates, config)
+        with connection:
+            connection.execute("INSERT OR IGNORE INTO selection_experiments VALUES (?, ?, ?, ?, ?)",
+                               (experiment, parameter, candidate_json,
+                                config.selection_outer_folds, config.selection_inner_folds))
+        for seed in config.selection_outer_seeds:
+            if exists(connection, "selection_scores", experiment=experiment, outer_seed=seed, workflow="nested"):
+                continue
+            print(f"  Selection {parameter}, candidates={candidates}, seed={seed}", flush=True)
+            splits = get_splits("kfold", config.selection_outer_folds, seed)
+            candidate_predictions = {
+                value: oof_predictions(config, X, y, splits, selection_params(parameter, value))[0]
+                for value in candidates
+            }
+            selected = min(candidates, key=lambda value: mean_squared_error(y, candidate_predictions[value]))
+            choices = [(experiment, "same_evidence", seed, -1, json.dumps(selected))]
+            nested = np.full(len(y), np.nan)
+            fold_ids = np.full(len(y), -1, dtype=int)
+            for fold, (train, validation) in enumerate(splits):
+                inner_X, inner_y = X.iloc[train].reset_index(drop=True), y.iloc[train].reset_index(drop=True)
+                inner_splits = list(KFold(n_splits=config.selection_inner_folds, shuffle=True,
+                                        random_state=10_000 + seed + fold).split(inner_X))
+                scores = {
+                    value: mean_squared_error(inner_y, oof_predictions(
+                        config, inner_X, inner_y, inner_splits, selection_params(parameter, value))[0])
+                    for value in candidates
+                }
+                chosen = min(candidates, key=scores.get)
+                choices.append((experiment, "nested", seed, fold, json.dumps(chosen)))
+                params = selection_params(parameter, chosen)
+                forest = make_forest(config, max_depth=params[0], min_samples_leaf=params[1],
+                                     min_samples_split=params[2], max_features=params[3])
+                forest.fit(X.iloc[train], y.iloc[train])
+                nested[validation] = forest.predict(X.iloc[validation])
+                fold_ids[validation] = fold
+            # Publish both workflows and their children atomically, once the seed finishes.
+            with connection:
+                connection.executemany("INSERT INTO selection_choices VALUES (?, ?, ?, ?, ?)", choices)
+                for workflow, pred in [("same_evidence", candidate_predictions[selected]), ("nested", nested)]:
+                    connection.execute("INSERT INTO selection_scores VALUES (?, ?, ?, ?, ?, ?)",
+                                       (experiment, workflow, seed, *metrics(y, pred)))
+                    connection.executemany("INSERT INTO selection_predictions VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        [(experiment, workflow, seed, i, int(fold_ids[i]), float(y.iloc[i]), float(pred[i]))
+                         for i in range(len(y))])
+    mark_stage(connection, "model_selection", digest)
 
 
 def run_validation(connection, config, digest, X, y, compositions, get_splits):
     stage = "validation"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
-    with connection:
-        connection.execute("DELETE FROM validation_predictions")
-        connection.execute("DELETE FROM validation_results")
     params = config.representative_params
     for method, counts in (("kfold", config.kfold_counts), ("loco", config.loco_counts)):
         for count in counts:
             for seed in config.validation_seeds:
+                if exists(connection, "validation_results", cv_method=method, cv_seed=seed, fold_count=count):
+                    continue
                 splits = get_splits(method, count, seed)
                 pred, folds, _ = oof_predictions(config, X, y, splits, params)
                 score = metrics(y, pred)
@@ -750,11 +825,6 @@ def run_validation(connection, config, digest, X, y, compositions, get_splits):
 
 def run_hyperparameters(connection, config, digest, X, y, get_splits):
     stage = "hyperparameters"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
-    with connection:
-        connection.execute("DELETE FROM hyperparameter_results")
     grid = itertools.product(
         config.max_depth_grid, config.min_samples_leaf_grid,
         config.min_samples_split_grid, config.max_features_grid,
@@ -768,6 +838,10 @@ def run_hyperparameters(connection, config, digest, X, y, get_splits):
                 splits = get_splits(method, count, seed)
                 rows = []
                 for params in grid:
+                    if exists(connection, "hyperparameter_results", cv_method=method,
+                              cv_seed=seed, fold_count=count, max_depth=depth_to_db(params[0]),
+                              min_samples_leaf=params[1], min_samples_split=params[2], max_features=params[3]):
+                        continue
                     pred, _, _ = oof_predictions(config, X, y, splits, params)
                     rows.append((
                         method, seed, RF_SEED, count, depth_to_db(params[0]),
@@ -785,14 +859,11 @@ def run_hyperparameters(connection, config, digest, X, y, get_splits):
 
 def run_importance(connection, config, digest, X, y, get_splits):
     stage = "importance"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
-    with connection:
-        connection.execute("DELETE FROM feature_importances")
-        connection.execute("DELETE FROM importance_runs")
     params = config.representative_params
     for method in ("kfold", "loco"):
+        if exists(connection, "importance_runs", cv_method=method,
+                  cv_seed=config.importance_cv_seed, fold_count=config.importance_fold_count):
+            continue
         splits = get_splits(method, config.importance_fold_count, config.importance_cv_seed)
         _, _, rows = oof_predictions(
             config, X, y, splits, params, collect_importance=True,
@@ -870,15 +941,7 @@ def perturbation_seed(cv_method, cv_seed, fold):
 
 def run_robustness(connection, config, digest, X, y, compositions, get_splits):
     stage = "robustness"
-    if stage_complete(connection, stage, digest):
-        print(f"Skipping completed stage: {stage}")
-        return
-    with connection:
-        connection.execute("DELETE FROM robustness_importances")
-        connection.execute("DELETE FROM robustness_predictions")
-        connection.execute("DELETE FROM robustness_results")
     params = config.representative_params
-    representative_seed = min(config.robustness_seeds)
     for method in ("kfold", "loco"):
         for cv_seed in config.robustness_seeds:
             splits = get_splits(method, config.robustness_fold_count, cv_seed)
@@ -890,6 +953,10 @@ def run_robustness(connection, config, digest, X, y, compositions, get_splits):
             ]
             for feature_noise in config.feature_noise_levels:
                 for target_noise in config.target_noise_levels:
+                    if exists(connection, "robustness_results", cv_method=method, cv_seed=cv_seed,
+                              fold_count=config.robustness_fold_count,
+                              feature_noise=feature_noise, target_noise=target_noise):
+                        continue
                     pred = np.full(len(y), np.nan)
                     importances = []
                     for fold, (train, validation) in enumerate(splits):
@@ -922,207 +989,118 @@ def run_robustness(connection, config, digest, X, y, compositions, get_splits):
                             [(result_id, name, float(value))
                              for name, value in zip(X.columns, mean_importance)],
                         )
-                        if cv_seed == representative_seed:
-                            connection.executemany(
-                                "INSERT INTO robustness_predictions VALUES (?, ?, ?, ?, ?)",
-                                [(result_id, i, compositions.iloc[i], float(y.iloc[i]),
-                                  float(pred[i])) for i in range(len(y))],
-                            )
+                        connection.executemany(
+                            "INSERT INTO robustness_predictions VALUES (?, ?, ?, ?, ?)",
+                            [(result_id, i, compositions.iloc[i], float(y.iloc[i]),
+                              float(pred[i])) for i in range(len(y))],
+                        )
     mark_stage(connection, stage, digest)
 
 
 def verify_database(connection, config, digest, dataset_sha256,
-                    n_observations, n_features):
-    required = {
-        "observations", "features", "excluded_columns", "cluster_assignments",
-        "convergence_results", "model_selection_summary", "model_selection_depth_choices",
-        "model_selection_predictions",
-        "validation_results", "validation_predictions", "hyperparameter_results",
-        "importance_runs", "feature_importances", "robustness_results",
-        "robustness_importances", "robustness_predictions", "metadata", "stage_status",
-    }
-    tables = {row[0] for row in connection.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    )}
-    missing = required - tables
-    if missing:
-        raise RuntimeError(f"Missing database tables: {sorted(missing)}")
-    expected_nonempty = required
-    counts = {}
-    for table in sorted(expected_nonempty):
-        counts[table] = connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-        if counts[table] == 0:
-            raise RuntimeError(f"Required table is empty: {table}")
-    if counts["observations"] != n_observations or counts["features"] != n_features:
-        raise RuntimeError("Dataset tables have unexpected dimensions")
-    cluster_counts = set(
-        config.loco_counts + config.hyper_loco_counts
-        + (config.importance_fold_count, config.robustness_fold_count)
-    )
-    expected_basic_counts = {
-        "cluster_assignments": len(cluster_counts) * n_observations,
-        "convergence_results": (
-            len(config.convergence_seeds) * len(config.convergence_estimators)
-        ),
-        "model_selection_summary": 2 * len(config.selection_outer_seeds),
-        "model_selection_depth_choices": len(config.selection_outer_seeds)
-        * (1 + config.selection_outer_folds),
-        "model_selection_predictions": (
-            2 * len(config.selection_outer_seeds) * n_observations
-        ),
-        "importance_runs": 2,
-        "feature_importances": (
-            2 * config.importance_fold_count * n_features
-            * (2 if config.permutation_repeats else 1)
-        ),
-    }
-    for table, expected in expected_basic_counts.items():
-        if counts[table] != expected:
-            raise RuntimeError(
-                f"{table} coverage is incomplete: expected {expected}, "
-                f"found {counts[table]}"
-            )
-    expected_validation_runs = len(config.validation_seeds) * (
-        len(config.kfold_counts) + len(config.loco_counts)
-    )
-    if counts["validation_results"] != expected_validation_runs:
-        raise RuntimeError(
-            "Validation-result coverage is incomplete: expected "
-            f"{expected_validation_runs}, found {counts['validation_results']}"
-        )
-    expected_validation_keys = {
-        (method, int(seed), int(count))
-        for method, fold_counts in (
-            ("kfold", config.kfold_counts), ("loco", config.loco_counts)
-        )
-        for count in fold_counts
-        for seed in config.validation_seeds
-    }
-    stored_validation_keys = {
-        (method, int(seed), int(count))
-        for method, seed, count in connection.execute(
-            "SELECT cv_method, cv_seed, fold_count FROM validation_results"
-        )
-    }
-    if stored_validation_keys != expected_validation_keys:
-        raise RuntimeError("Validation method/seed/fold-count coverage is incomplete")
-    expected_validation_predictions = expected_validation_runs * n_observations
-    if counts["validation_predictions"] != expected_validation_predictions:
-        raise RuntimeError(
-            "OOF prediction coverage is incomplete: expected "
-            f"{expected_validation_predictions}, found "
-            f"{counts['validation_predictions']}"
-        )
-    invalid_prediction_experiments = connection.execute(
-        """SELECT COUNT(*) FROM (
-               SELECT experiment_id, COUNT(*) AS n_rows,
-                      COUNT(DISTINCT observation_id) AS n_observations,
-                      SUM(CASE WHEN y_pred IS NULL OR y_true IS NULL
-                                    OR ABS(y_pred) > 1.0e308
-                                    OR ABS(y_true) > 1.0e308
-                               THEN 1 ELSE 0 END) AS missing
-               FROM validation_predictions
-               GROUP BY experiment_id
-               HAVING n_rows != ? OR n_observations != ? OR missing != 0
-           )""",
-        (n_observations, n_observations),
-    ).fetchone()[0]
-    if invalid_prediction_experiments:
-        raise RuntimeError(
-            f"{invalid_prediction_experiments} validation experiments lack exactly "
-            "one finite OOF prediction per observation"
-        )
-    invalid_validation_rows = connection.execute(
-        """SELECT COUNT(*)
-           FROM validation_predictions p
-           JOIN validation_results v USING (experiment_id)
-           JOIN observations o USING (observation_id)
-           WHERE p.fold < 0 OR p.fold >= v.fold_count
-              OR p.composition != o.composition OR p.y_true != o.observed_target"""
-    ).fetchone()[0]
-    if invalid_validation_rows:
-        raise RuntimeError(
-            f"Found {invalid_validation_rows} invalid validation-prediction rows"
-        )
-    distinct_rf_seeds = connection.execute(
-        "SELECT COUNT(DISTINCT rf_seed) FROM validation_results"
-    ).fetchone()[0]
-    stored_rf_seed = connection.execute(
-        "SELECT MIN(rf_seed) FROM validation_results"
-    ).fetchone()[0]
-    if distinct_rf_seeds != 1 or stored_rf_seed != RF_SEED:
-        raise RuntimeError("Validation-seed experiments did not hold the RF seed fixed")
-    hyperparameter_combinations = (
-        len(config.max_depth_grid) * len(config.min_samples_leaf_grid)
-        * len(config.min_samples_split_grid) * len(config.max_features_grid)
-    )
-    expected_hyperparameter_results = (
-        hyperparameter_combinations * len(config.hyperparameter_seeds)
-        * (len(config.hyper_kfold_counts) + len(config.hyper_loco_counts))
-    )
-    if counts["hyperparameter_results"] != expected_hyperparameter_results:
-        raise RuntimeError("Hyperparameter-result coverage is incomplete")
-    expected_robustness_results = (
-        2 * len(config.robustness_seeds)
-        * len(config.feature_noise_levels) * len(config.target_noise_levels)
-    )
-    if counts["robustness_results"] != expected_robustness_results:
-        raise RuntimeError("Robustness-result coverage is incomplete")
-    if counts["robustness_importances"] != expected_robustness_results * n_features:
-        raise RuntimeError("Robustness-importance coverage is incomplete")
-    expected_robustness_predictions = (
-        2 * len(config.feature_noise_levels) * len(config.target_noise_levels)
-        * n_observations
-    )
-    if counts["robustness_predictions"] != expected_robustness_predictions:
-        raise RuntimeError("Representative robustness-prediction coverage is incomplete")
-    metadata = {
-        key: json.loads(value)
-        for key, value in connection.execute("SELECT key, value FROM metadata")
-    }
-    required_metadata = {
-        "schema_version", "mode", "config_hash", "dataset_sha256",
-        "python_version", "sklearn_version", "numpy_version", "pandas_version", "rf_seed",
-        "validation_cv_seeds", "representative_hyperparameters",
-        "perturbation_seed_rule", "perturbation_reuse_rule", "config",
-    }
-    missing_metadata = required_metadata - metadata.keys()
-    if missing_metadata:
-        raise RuntimeError(f"Missing provenance metadata: {sorted(missing_metadata)}")
-    if metadata.get("schema_version") != SCHEMA_VERSION:
-        raise RuntimeError("Database schema metadata does not match the generator")
-    if metadata.get("config_hash") != digest:
-        raise RuntimeError("Database experiment digest does not match current provenance")
-    if metadata.get("dataset_sha256") != dataset_sha256:
-        raise RuntimeError("Database dataset hash does not match the source CSV")
-    if connection.execute(
-        "SELECT COUNT(*) FROM features WHERE feature_name='composition'"
-    ).fetchone()[0]:
-        raise RuntimeError("composition leaked into the feature table")
-    expected_stages = {
-        "clusters", "convergence", "model_selection", "validation",
-        "hyperparameters", "importance", "robustness",
-    }
-    stored_stages = {
-        stage: stage_digest for stage, stage_digest in connection.execute(
-            "SELECT stage, config_hash FROM stage_status"
-        )
-    }
-    if set(stored_stages) != expected_stages or any(
-        stage_digest != digest for stage_digest in stored_stages.values()
-    ):
-        raise RuntimeError("Not every precompute stage completed")
-    return counts
+                    n_observations, n_features, studies=None):
+    """Validate requested keys and child coverage; supersets are intentionally allowed."""
+    studies = set(studies or STUDIES)
+    metadata = dict(connection.execute("SELECT key, value FROM metadata"))
+    if json.loads(metadata["dataset_sha256"]) != dataset_sha256:
+        raise RuntimeError("Dataset hash mismatch")
+    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise RuntimeError("SQLite integrity check failed")
+    def require(table, **keys):
+        if not exists(connection, table, **keys):
+            raise RuntimeError(f"Missing {table} experiment: {keys}")
+    if "clusters" in studies:
+        for count in set(config.loco_counts + config.hyper_loco_counts +
+                         (config.importance_fold_count, config.robustness_fold_count)):
+            total = connection.execute("SELECT COUNT(*) FROM cluster_assignments WHERE cluster_count=?", (count,)).fetchone()[0]
+            if total != n_observations:
+                raise RuntimeError(f"Incomplete cluster assignment: {count}")
+    if "convergence" in studies:
+        for seed, trees in itertools.product(config.convergence_seeds, config.convergence_estimators):
+            require("convergence_results", cv_seed=seed, n_estimators=trees)
+    if "validation" in studies:
+        for method, counts in [("kfold", config.kfold_counts), ("loco", config.loco_counts)]:
+            for seed, count in itertools.product(config.validation_seeds, counts):
+                require("validation_results", cv_method=method, cv_seed=seed, fold_count=count)
+    if "hyperparameters" in studies:
+        for method, counts in [("kfold", config.hyper_kfold_counts), ("loco", config.hyper_loco_counts)]:
+            for seed, count, depth, leaf, split, features in itertools.product(
+                    config.hyperparameter_seeds, counts, config.max_depth_grid,
+                    config.min_samples_leaf_grid, config.min_samples_split_grid, config.max_features_grid):
+                require("hyperparameter_results", cv_method=method, cv_seed=seed, fold_count=count,
+                        max_depth=depth_to_db(depth), min_samples_leaf=leaf,
+                        min_samples_split=split, max_features=features)
+    if "importance" in studies:
+        for method in ("kfold", "loco"):
+            require("importance_runs", cv_method=method, cv_seed=config.importance_cv_seed,
+                    fold_count=config.importance_fold_count)
+    if "robustness" in studies:
+        for method, seed, feature, target in itertools.product(
+                ("kfold", "loco"), config.robustness_seeds, config.feature_noise_levels, config.target_noise_levels):
+            require("robustness_results", cv_method=method, cv_seed=seed,
+                    fold_count=config.robustness_fold_count, feature_noise=feature, target_noise=target)
+    if "model_selection" in studies:
+        for parameter, candidates in selection_grids(config).items():
+            experiment = connection.execute(
+                "SELECT experiment FROM selection_experiments WHERE parameter=? AND candidates=? AND outer_folds=? AND inner_folds=?",
+                (parameter, json.dumps(list(candidates)), config.selection_outer_folds, config.selection_inner_folds),
+            ).fetchone()
+            if experiment is None:
+                raise RuntimeError(f"Missing selection study: {parameter}")
+            for seed, workflow in itertools.product(config.selection_outer_seeds, ("nested", "same_evidence")):
+                require("selection_scores", experiment=experiment[0], outer_seed=seed, workflow=workflow)
+                rows = connection.execute("SELECT COUNT(*) FROM selection_predictions WHERE experiment=? AND outer_seed=? AND workflow=?",
+                                          (experiment[0], seed, workflow)).fetchone()[0]
+                if rows != n_observations:
+                    raise RuntimeError("Incomplete selection predictions")
+    # Parent/child records are saved atomically. Validate complete stored runs, not just totals.
+    for parent, child, key, expected in [
+        ("validation_results", "validation_predictions", "experiment_id", n_observations),
+        ("robustness_results", "robustness_importances", "result_id", n_features),
+    ]:
+        for identifier, count in connection.execute(
+                f"SELECT p.{key}, COUNT(c.{key}) FROM {parent} p LEFT JOIN {child} c USING ({key}) GROUP BY p.{key}"):
+            if count != expected:
+                raise RuntimeError(f"Incomplete {child}: {identifier}")
+    return {table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+            for (table,) in connection.execute("SELECT name FROM sqlite_master WHERE type='table' AND name!='sqlite_sequence'").fetchall()}
+
+
+STUDIES = ("clusters", "convergence", "model_selection", "validation", "hyperparameters", "importance", "robustness")
+
+
+def validate_config(config):
+    for name, value in asdict(config).items():
+        if isinstance(value, tuple) and (not value or len(set(value)) != len(value)):
+            raise ValueError(f"{name} must be nonempty and contain no duplicates")
+    for parameter, values in selection_grids(config).items():
+        for value in values:
+            validate_param_tuple(*selection_params(parameter, value))
+    for params in itertools.product(config.max_depth_grid, config.min_samples_leaf_grid,
+                                    config.min_samples_split_grid, config.max_features_grid):
+        validate_param_tuple(*params)
+    for name in ("feature_noise_levels", "target_noise_levels"):
+        values = getattr(config, name)
+        if 0 not in values or any(v < 0 for v in values):
+            raise ValueError(f"{name} must include zero and contain only nonnegative values")
+    for name, value in asdict(config).items():
+        values = value if isinstance(value, tuple) else (value,)
+        if "fold" in name or name.endswith("counts"):
+            if any(not isinstance(v, int) or v < 2 for v in values):
+                raise ValueError(f"{name} requires integers >= 2")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("smoke", "full"), default="smoke",
-        help="safe default: smoke",
+        "--mode", choices=("smoke", "full"), default=None,
+        help="default: use existing database config, or smoke for a new database",
     )
     parser.add_argument("--database", type=Path, default=None)
-    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--overwrite", action="store_true", help="explicitly erase all saved studies")
+    parser.add_argument("--config", type=Path, help="JSON object overriding selected ExperimentConfig fields")
+    parser.add_argument("--studies", nargs="+", choices=STUDIES, default=list(STUDIES))
+    parser.add_argument("--jobs", type=int, default=-1, help="parallel trees per forest; experiment loop stays serial")
     parser.add_argument(
         "--yes", action="store_true",
         help="required for non-interactive FULL_PRECOMPUTE",
@@ -1132,16 +1110,32 @@ def parse_args():
 
 def main():
     args = parse_args()
-    config = SMOKE_CONFIG if args.mode == "smoke" else FULL_CONFIG
+    global N_JOBS
+    N_JOBS = args.jobs
+    if N_JOBS == 0:
+        raise ValueError("--jobs cannot be zero")
     root = find_repository_root(Path.cwd())
     dataset_path = root / "demonstrations" / "data" / "featurized_matbench_expt_gap.csv"
     dataset_sha256 = hashlib.sha256(dataset_path.read_bytes()).hexdigest()
     database_path = args.database or (
         root / "demonstrations" / "precomputed" / "rfr_precomputed_results.sqlite"
     )
+    config = FULL_CONFIG if args.mode == "full" else SMOKE_CONFIG
+    if args.mode is None and database_path.exists() and not args.overwrite:
+        with sqlite3.connect(database_path) as saved:
+            row = saved.execute("SELECT value FROM metadata WHERE key='config'").fetchone()
+            if row:
+                config = FULL_CONFIG if json.loads(row[0])["mode"] == FULL_PRECOMPUTE else SMOKE_CONFIG
+                config = replace(config, **{key: tuple(value) if isinstance(value, list) else value
+                                           for key, value in json.loads(row[0]).items()})
+    if args.config:
+        overrides = json.loads(args.config.read_text())
+        config = replace(config, **{key: tuple(value) if isinstance(value, list) else value
+                                   for key, value in overrides.items()})
+    validate_config(config)
     fits = estimate_fit_count(config)
     print(f"Mode: {config.mode}")
-    print("Estimated RandomForestRegressor fits:")
+    print("Upper-bound fits for all studies before cache reuse (selected studies: " + ", ".join(args.studies) + "):")
     for name, count in fits.items():
         print(f"  {name:28s} {count:,}")
     print(f"Main ensemble size: {config.fixed_n_estimators} trees")
@@ -1181,10 +1175,12 @@ def main():
             (run_robustness, (X, y, compositions, get_splits)),
         )
         for function, stage_args in stages:
-            print(f"Running {function.__name__} ...")
+            if function.__name__.removeprefix("run_") not in args.studies:
+                continue
+            print(f"Running {function.__name__} ...", flush=True)
             function(connection, config, digest, *stage_args)
         counts = verify_database(
-            connection, config, digest, dataset_sha256, len(y), X.shape[1]
+            connection, config, digest, dataset_sha256, len(y), X.shape[1], args.studies
         )
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
