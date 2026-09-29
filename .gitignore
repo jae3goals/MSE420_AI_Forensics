@@ -16,6 +16,9 @@ env/
 .env
 *.sqlite
 *.db
+*.sqlite-shm
+*.sqlite-wal
+!demonstrations/precomputed/rfr_precomputed_results.sqlite
 artifacts/
 
 # Editor settings
