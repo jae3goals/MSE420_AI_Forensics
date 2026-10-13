@@ -18,3 +18,13 @@ dependencies:
       - notebook==6.5.4
       - ipykernel==6.25.0
       - ipywidgets==8.0.4
+      - requests==2.34.2
+      - tqdm==4.70.1
+      # Legacy-compatible ALIGNN stack used by the MP18 robustness notebook.
+      - torch==2.2.1
+      - torchdata==0.7.1
+      - dgl==2.1.0
+      - alignn==2024.12.12
+      - jarvis-tools==2024.10.30
+      # Parameter-space stability analysis; commit inspected and tested with ALIGNN.
+      - oxford-loss-landscapes @ git+https://github.com/TRustworthy-AI-Tools-for-Science/oxford-loss-landscapes.git@77b05b5b3845117abc7ad6b0df5950ecdd507826
