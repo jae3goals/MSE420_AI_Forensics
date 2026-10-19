@@ -1,0 +1,27 @@
+name: mse420-sam
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # Matched pair used by the SEM robustness-and-stability demonstration.
+      - torch==2.5.1
+      - torchvision==0.20.1
+      # Direct scientific and image-processing dependencies used by its notebook.
+      - numpy==2.0.1
+      - pandas==2.3.3
+      - scipy==1.13.1
+      - matplotlib==3.9.2
+      - seaborn==0.13.2
+      - scikit-learn==1.6.1
+      - scikit-image==0.24.0
+      - imageio==2.37.2
+      - pillow==11.1.0
+      - opencv-python==4.13.0.90
+      - pytorch-msssim==1.0.0
+      - tqdm==4.67.1
+      - ipykernel==6.30.1
+      - ipywidgets==8.1.5
+      # Meta's original Segment Anything implementation, pinned for reproducibility.
+      - "segment-anything @ git+https://github.com/facebookresearch/segment-anything.git@dca509fe793f601edb92606367a655c15ac00fdf"

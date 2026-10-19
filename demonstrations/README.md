@@ -55,3 +55,22 @@ Regression checks:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+## SAM robustness and stability
+
+[`sam_sem_robustness_stability_analysis.ipynb`](sam_sem_robustness_stability_analysis.ipynb)
+studies how SEM-image degradations change pooled SAM ViT-B representations and
+how local mask-decoder parameter perturbations affect fixed-prompt predictions.
+Its ten input images are stored in `data/trajectory images/`.
+
+Create the dedicated environment from the repository root:
+
+```bash
+conda env create -f environment-sam.yml
+conda activate mse420-sam
+python -m ipykernel install --user --name mse420-sam --display-name "MSE420 SAM"
+```
+
+Download Meta's `sam_vit_b_01ec64.pth` checkpoint into
+`weights/segment-anything/`. Model checkpoints and generated analysis caches are
+intentionally ignored by Git.

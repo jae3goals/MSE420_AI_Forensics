@@ -21,5 +21,8 @@ env/
 !demonstrations/precomputed/rfr_precomputed_results.sqlite
 artifacts/
 
+# Downloaded model checkpoints
+weights/segment-anything/*.pth
+
 # Editor settings
 .vscode/
