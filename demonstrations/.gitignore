@@ -1,0 +1,6 @@
+
+# Local inference checkpoints (downloaded once, never committed).
+models/
+
+# Reusable local inference cache; includes raw prompt and response text.
+gifters_results/checkpoints_v2/
